@@ -1,0 +1,19 @@
+---
+station:
+  user: "W2xxx-1"
+  pass: "12345"
+  lat: "4068.92N"
+  long: "7404.44W"
+  serialPort: '/dev/ttyUSB0'
+
+aprsService:
+  host: "noam.aprs2.net"  # north america tier2 servers round robin
+  port: 14580
+  buffer_size: 512
+
+beacon:
+  icon: "&"
+  overlay: "R"
+  toCall: ">APZYG2"  # Software version used as TOCALL
+  message: "Yaesu ygate https://github.com/craigerl/ygate"
+  beaconIntervalSeconds: 1800
