@@ -18,13 +18,14 @@
 #  Be sure to set your callsign, password and position below.
 #
 
+import argparse
 import re
 import serial
 import time
-import threading
 import signal
 import os
 import socket
+import yaml
 from enum import Enum
 
 # User specific constants (please fill these out accordingly)
@@ -50,6 +51,60 @@ MY_POSITION_STRING = USER + TO_CALL + ",TCPIP*:!" + POSITION + ICON + MESSAGE + 
 MY_LOGIN_STRING = "user " + USER + " pass " + PASS + " vers ygate.py 2.00\n"
 BEACON_INTERVAL_S = 1800
 
+sock = None
+ser = None
+
+def apply_config(c):
+    # FIXME: remove global vars, just quick and dirty for a PoC
+    global USER
+    global PASS
+    global LAT
+    global LONG
+    # SERIAL_PORT = 'COM9' # Windows
+    global SERIAL_PORT
+
+    # APRS-IS specific constants
+    global HOST
+    global PORT
+    global ICON
+    global OVERLAY
+    global BUFFER_SIZE
+
+    # My position string constants
+    global POSITION
+    global TO_CALL
+    global MESSAGE
+    global MY_POSITION_STRING
+    global MY_LOGIN_STRING
+    global BEACON_INTERVAL_S
+
+    # User specific constants (please fill these out accordingly)
+    station = c.get("station")
+    aprsService = c.get("aprsService")
+    beacon = c.get("beacon")
+    USER = station.get("user")
+    PASS = station.get("pass")
+    LAT = station.get("lat")
+    LONG = station.get("long")
+    # SERIAL_PORT = 'COM9' # Windows
+    SERIAL_PORT = station.get("serialPort")
+
+    # APRS-IS specific constants
+    HOST = aprsService.get("host")
+    PORT = aprsService.get("port")
+    ICON = beacon.get("icon")
+    OVERLAY = beacon.get("overlay")
+    BUFFER_SIZE = aprsService.get("bufferSize")
+
+    # My position string constants
+    POSITION = LAT + OVERLAY + LONG
+    TO_CALL = beacon.get("toCall")
+    MESSAGE = beacon.get("message")
+    MY_POSITION_STRING = USER + TO_CALL + ",TCPIP*:!" + POSITION + ICON + MESSAGE + "\r\n"
+    MY_LOGIN_STRING = "user " + USER + " pass " + PASS + " vers ygate.py 2.00\n"
+    BEACON_INTERVAL_S = beacon.get("beaconIntervalSeconds")
+
+    
 
 # State Machine definitions
 class AprsIsState(Enum):
@@ -64,7 +119,7 @@ def signal_handler(signal, frame):
     sock.shutdown(0)
     sock.close()
     ser.close
-    time.sleep(2)
+    time.sleep(.5)
     os._exit(0)
 
 
@@ -80,7 +135,7 @@ def setup_socket(buffer_size):
 
 
 # Shutdown/close socket
-def reset_socket():
+def reset_socket(sock):
     try:
         sock.shutdown(0)
         sock.close()
@@ -90,7 +145,7 @@ def reset_socket():
 
 
 # Try to connect to aprs-is
-def connect_to_server():
+def connect_to_server(sock):
     success = False
     try:
         sock.connect((HOST, PORT))
@@ -103,7 +158,7 @@ def connect_to_server():
 
 
 # Try to send to aprs-is
-def send_to_server(packet_string):
+def send_to_server(sock, packet_string):
     success = False
     try:
         sock.send(bytes(packet_string, "utf-8"))
@@ -114,115 +169,117 @@ def send_to_server(packet_string):
     finally:
         return success
 
+# FIXME: Hold sock, ser and other states in a dedicated context
+def ygate_loop(args, config):
+    global sock  # FIXME: move away from globals
+    global ser
+    # Register the ctrl-c signal handler
+    signal.signal(signal.SIGINT, signal_handler)
 
-# Register the ctrl-c signal handler
-signal.signal(signal.SIGINT, signal_handler)
+    # Open the specified serial port
+    try:
+        ser = serial.Serial(SERIAL_PORT, 9600, timeout=3)
+    except Exception as e:
+        print(">>> FAILED to open " + SERIAL_PORT + "\n")
+        print(e)
+        os._exit(1)  # If we can't do this, we're done!
 
-# Open the specified serial port
-try:
-    ser = serial.Serial(SERIAL_PORT, 9600)
-except Exception as e:
-    print(">>> FAILED to open " + SERIAL_PORT + "\n")
-    print(e)
-    os._exit(1)  # If we can't do this, we're done!
+    run_state = AprsIsState.NOCONNECT
 
-run_state = AprsIsState.NOCONNECT
+    # read nmea9 sentences from yaesu radio
+    # arrange them into aprs packet strings
+    # inject our callsign in the routing chain
+    # drop packets which shouldn't be forwarded to APRS-IS
+    #
+    # Yaesu output looks like this:
+    #    AA6I>APOTU0,K6IXA-3,VACA,WIDE2* [06/02/18 13:47:54] <UI>:
+    #
+    #    /022047z3632.30N/11935.16Wk136/055/A=000300ENROUTE
+    #
+    # after removing a random number of yaesu-injected line feeds we rearrange into a real APRS packet like this:
+    #    AA6I>APOTU0,K6IXA-3,VACA,WIDE2*,qAO,KM6XXX-1:/022047z3632.30N/11935.16Wk136/055/A=000300ENROUTE
+    #
 
-# read nmea9 sentences from yaesu radio
-# arrange them into aprs packet strings
-# inject our callsign in the routing chain
-# drop packets which shouldn't be forwarded to APRS-IS
-#
-# Yaesu output looks like this:
-#    AA6I>APOTU0,K6IXA-3,VACA,WIDE2* [06/02/18 13:47:54] <UI>:
-#
-#    /022047z3632.30N/11935.16Wk136/055/A=000300ENROUTE
-#
-# after removing a random number of yaesu-injected line feeds we rearrange into a real APRS packet like this:
-#    AA6I>APOTU0,K6IXA-3,VACA,WIDE2*,qAO,KM6XXX-1:/022047z3632.30N/11935.16Wk136/055/A=000300ENROUTE
-#
+    # Force sending my position first time around
+    last_beacon_time = time.time() - BEACON_INTERVAL_S
 
-# Force sending my position first time around
-last_beacon_time = time.time() - BEACON_INTERVAL_S
 
-while True:
-
-    match run_state:
-
-        case AprsIsState.NOCONNECT:
-            sock, sock_file = setup_socket(BUFFER_SIZE)
-            if connect_to_server() == True:
-                run_state = AprsIsState.CONNECTED
-            else:
-                reset_socket()
-                time.sleep(5)
-
-        case AprsIsState.CONNECTED:
-            if send_to_server(MY_LOGIN_STRING) == True:
-                version = sock_file.readline().strip()
-                print(version)
-                login_response = sock_file.readline().strip()
-                print(login_response)
-                if "verified" in login_response:
-                    print("Login SUCCESS\n")
-                    run_state = AprsIsState.LOGGED_IN
+    while True:
+        match run_state:
+            case AprsIsState.NOCONNECT:
+                sock, sock_file = setup_socket(BUFFER_SIZE)
+                if connect_to_server(sock) == True:
+                    run_state = AprsIsState.CONNECTED
                 else:
-                    print("Login FAILURE\n")
-                    sock.shutdown(0)
-                    sock.close()
-                    ser.close()
-                    os._exit(1)  # If we can't do this, we're done!
-
-        case AprsIsState.LOGGED_IN:
-            line = ser.readline()
-            line = line.decode("utf-8", errors="ignore")
-            line = line.strip("\n\r")
-            if re.search(
-                "\[.*\] <UI.*>:", str(line)
-            ):  # Yaesu's nmea9-formatted suffix means we found a routing block
-                routing = line
-                routing = re.sub(
-                    " \[.*\] <UI.*>:", ",qAO," + USER + ":", routing
-                )  # drop nmea/yaesu gunk, append us to routing block
-                payload = (
-                    ser.readline()
-                )  # next non-empty line is the payload, strip random number of yaesu line feeds
-                payload = payload.decode("utf-8", errors="ignore")
-                payload = payload.strip("\n\r")
-                packet = routing + payload
-
-                # Drop those packets we shouldn't send to APRS-IS
-                if len(payload) == 0:
-                    print(
-                        ">>> No payload, not igated:  " + packet
-                    )  # aprs-is servers also notice and drop empty packets, no spec for this
-                    continue
-                if re.search(",TCP", routing):  # drop packets sourced from internet
-                    print(">>> Internet packet not igated:  " + packet)
-                    continue
-                if re.search(
-                    "^}.*,TCP.*:", payload
-                ):  # drop packets sourced from internet in third party packets
-                    print(">>> Internet packet not igated:  " + packet)
-                    continue
-                if "RFONLY" in routing:
-                    print(">>> RFONLY, not igated: " + packet)
-                    continue
-                if "NOGATE" in routing:
-                    print(">>> NOGATE, not igated: " + packet)
-                    continue
-
-                # Send the packet to APRS-IS
-                print("[0.0] " + packet)
-                if send_to_server(packet + "\r\n") == False:
-                    reset_socket()
+                    reset_socket(sock)
                     time.sleep(5)
-                    run_state = AprsIsState.NOCONNECT
+
+            case AprsIsState.CONNECTED:
+                if send_to_server(sock, MY_LOGIN_STRING) == True:
+                    version = sock_file.readline().strip()
+                    print(version)
+                    login_response = sock_file.readline().strip()
+                    print(login_response)
+                    if "verified" in login_response:
+                        print("Login SUCCESS\n")
+                        run_state = AprsIsState.LOGGED_IN
+                    else:
+                        print("Login FAILURE\n")
+                        sock.shutdown(0)
+                        sock.close()
+                        ser.close()
+                        os._exit(1)  # If we can't do this, we're done!
+
+            case AprsIsState.LOGGED_IN:
+                line = ser.readline()
+                line = line.decode("utf-8", errors="ignore")
+                line = line.strip("\n\r")
+                if re.search(
+                    "\[.*\] <UI.*>:", str(line)
+                ):  # Yaesu's nmea9-formatted suffix means we found a routing block
+                    routing = line
+                    routing = re.sub(
+                        " \[.*\] <UI.*>:", ",qAO," + USER + ":", routing
+                    )  # drop nmea/yaesu gunk, append us to routing block
+                    payload = (
+                        ser.readline()
+                    )  # next non-empty line is the payload, strip random number of yaesu line feeds
+                    payload = payload.decode("utf-8", errors="ignore")
+                    payload = payload.strip("\n\r")
+                    packet = routing + payload
+
+                    # Drop those packets we shouldn't send to APRS-IS
+                    if len(payload) == 0:
+                        print(
+                            ">>> No payload, not igated:  " + packet
+                        )  # aprs-is servers also notice and drop empty packets, no spec for this
+                        continue
+                    if re.search(",TCP", routing):  # drop packets sourced from internet
+                        print(">>> Internet packet not igated:  " + packet)
+                        continue
+                    if re.search(
+                        "^}.*,TCP.*:", payload
+                    ):  # drop packets sourced from internet in third party packets
+                        print(">>> Internet packet not igated:  " + packet)
+                        continue
+                    if "RFONLY" in routing:
+                        print(">>> RFONLY, not igated: " + packet)
+                        continue
+                    if "NOGATE" in routing:
+                        print(">>> NOGATE, not igated: " + packet)
+                        continue
+
+                    # Send the packet to APRS-IS
+                    print("[0.0] " + packet)
+                    if send_to_server(sock, packet + "\r\n") == False:
+                        reset_socket()
+                        time.sleep(5)
+                        run_state = AprsIsState.NOCONNECT
 
                 # Check to see if its time to beacon
                 current_time = time.time()
                 if current_time - last_beacon_time > BEACON_INTERVAL_S:
-                    if send_to_server(MY_POSITION_STRING) == False:
+                    if send_to_server(sock, MY_POSITION_STRING) == False:
                         reset_socket()
                         time.sleep(5)
                         run_state = AprsIsState.NOCONNECT
@@ -230,7 +287,32 @@ while True:
                         print(MY_POSITION_STRING.strip())
                         last_beacon_time = current_time
 
-# We never get here, but these things happen in the ctrl-c handler
-ser.close()
-sock.shutdown(0)
-sock.close()
+    # We never get here, but these things happen in the ctrl-c handler
+    ser.close()
+    sock.shutdown(0)
+    sock.close()
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--config", "-c", dest="config", default="config.yaml",
+        help="Path to config file")
+    return parser.parse_args()
+
+def load_config(path):
+    with open(path, "r") as f:
+        try:
+            return yaml.load(f, Loader=yaml.FullLoader)
+        except yaml.YAMLError as ex:
+            print("YAML error while reading %r." % path)
+    return None
+
+def main():
+    print("Starting...")
+    args = parse_args()
+    config = load_config(args.config)
+    apply_config(config)
+    ygate_loop(args, config)
+
+if __name__ == "__main__":
+    main()

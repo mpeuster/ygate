@@ -9,7 +9,7 @@ station:
 aprsService:
   host: "noam.aprs2.net"  # north america tier2 servers round robin
   port: 14580
-  buffer_size: 512
+  bufferSize: 512
 
 beacon:
   icon: "&"
